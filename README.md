@@ -19,19 +19,10 @@ Emotions play a crucial role in human behavior and decision-making, making emoti
 ## Reference
 
 ```
-@ARTICLE{2025arXiv250200547W,
-       author = {{Wang}, Zaitian and {He}, Jian and {Liang}, Yu and {Hu}, Xiyuan and {Peng}, Tianhao and {Wang}, Kaixin and {Wang}, Jiakai and {Zhang}, Chenlong and {Zhang}, Weili and {Niu}, Shuang and {Xie}, Xiaoyang},
-        title = "{Milmer: a Framework for Multiple Instance Learning based Multimodal Emotion Recognition}",
-      journal = {arXiv e-prints},
-     keywords = {Computer Science - Computer Vision and Pattern Recognition, Computer Science - Artificial Intelligence, Computer Science - Human-Computer Interaction},
-         year = 2025,
-        month = feb,
-          eid = {arXiv:2502.00547},
-        pages = {arXiv:2502.00547},
-archivePrefix = {arXiv},
-       eprint = {2502.00547},
- primaryClass = {cs.CV},
-       adsurl = {https://ui.adsabs.harvard.edu/abs/2025arXiv250200547W},
-      adsnote = {Provided by the SAO/NASA Astrophysics Data System}
+@article{wang2025milmer,
+  title={Milmer: a Framework for Multiple Instance Learning based Multimodal Emotion Recognition},
+  author={Wang, Zaitian and He, Jian and Liang, Yu and Hu, Xiyuan and Peng, Tianhao and Wang, Kaixin and Wang, Jiakai and Zhang, Chenlong and Zhang, Weili and Niu, Shuang and others},
+  journal={arXiv preprint arXiv:2502.00547},
+  year={2025}
 }
 ```
