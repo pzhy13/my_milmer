@@ -1,2 +1,9 @@
 .DS_Store 
 */.DS_Store 
+code/video/
+code/faces/
+code/local_swin_model/
+code/face_video/
+code/EEGData/
+code/data_preprocessed_matlab/
+code/_pycache_/
