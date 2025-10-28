@@ -7,3 +7,12 @@ code/face_video/
 code/EEGData/
 code/data_preprocessed_matlab/
 code/_pycache_/
+.vscode/settings.json
+requirements.txt
+code/best_model_fast_run.pth
+code/EEG_preprocessing.py
+code/__pycache__/model.cpython-310.pyc
+code/train.log
+code/train_kfold.log
+code/EEG_preprocessing.ipynb
+code/train_fast.log
