@@ -15,3 +15,13 @@ code/train.log
 code/train_kfold.log
 code/train_fast.log
 code/EEG_preprocessing.ipynb
+code/seaborn-0.13.2-py3-none-any.whl
+code/test_gpu_oom_check_final.log
+code/test_gpu_oom_check.log
+code/test_on_all.log
+code/test_oom_check.log
+code/test_single_gpu_bs1.log
+code/confusion_matrix_eeg_only_all_data.png
+code/confusion_matrix_image_only_all_data.png
+code/confusion_matrix_multimodal_all_data.png
+code/best_model_fast_run_1.pth

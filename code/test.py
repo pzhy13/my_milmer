@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from transformers import SwinModel, AutoImageProcessor
 from PIL import Image
 import numpy as np
@@ -12,35 +12,34 @@ import logging
 import sys
 import matplotlib.pyplot as plt
 import seaborn as sns
-from collections import OrderedDict # 用于处理 DataParallel 权重
+from collections import OrderedDict 
 
-# --- 1. 导入已修正的 model.py (确保它是包含单模态支持的版本) ---
+# --- 1. 导入已修正的 model.py ---
 from model import MultiModalClassifier 
 
-# --- 2. 定义全局 device ---
-# 强制使用 PyTorch 能看到的第一个 CUDA 设备 (通常是 GPU 0)
-# 如果没有 CUDA，则回退到 CPU
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") 
+# --- 2. 定义全局 device (通用 cuda) ---
+# (不再强制 cuda:0)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
 
 # --- 3. 定义超参数 ---
-ALL_SUBJECTS = [s for s in range(1, 23) if s != 11] # s01-s10, s12-s22 (共 21 人)
-
+ALL_SUBJECTS = [s for s in range(1, 23) if s != 11] 
 NUM_CLASSES = 4 
 NUM_INSTANCES = 10 
 NUM_SELECT = 3     
 MODEL_PATH = "./local_swin_model/" 
-CHECKPOINT_PATH = './best_model_fast_run.pth' # <-- 确认模型路径
+CHECKPOINT_PATH = './best_model_fast_run.pth' 
 
-# --- 关键修改：强制 Batch Size = 1 ---
-# 这是单卡 10GB 显存运行此模型的唯一希望
-BATCH_SIZE = 8
+# --- 关键修改：设置 BATCH_SIZE (占位符) ---
+# 警告：您必须使用 find_max_batch_size.py 找到最大值！
+# 这里的 '12' 假设 3 块 GPU 每块跑 4 个。
+BATCH_SIZE = 12 
 
 # --- 4. 设置日志记录 (Logging) ---
-def setup_logging(log_file='test_single_gpu_bs1.log'): # 新日志名
+def setup_logging(log_file='test_multi_gpu.log'): # 新日志名
     logging.getLogger().handlers = [] 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter(f'%(asctime)s - RANK_{rank} - %(levelname)s - %(message)s')
     file_handler = logging.FileHandler(log_file)
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
@@ -49,12 +48,11 @@ def setup_logging(log_file='test_single_gpu_bs1.log'): # 新日志名
     stream_handler.setLevel(logging.INFO)
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
-    logging.info("--- 测试脚本日志系统已启动 (强制单 GPU, BS=1) ---")
+    logging.info("--- 测试脚本日志系统已启动 (多 GPU, BS={BATCH_SIZE}) ---")
 
-# --- 5. DEAP 数据集类 (与之前相同，包含来源追踪) ---
+# --- 5. DEAP 数据集类 (无修改) ---
 class DEAPDataset(Dataset):
-    # ... (将包含 self.sample_info 的 DEAPDataset 类完整复制到这里) ...
-    # 为了简洁，这里省略
+    # ... (此处省略，与原文件相同) ...
     def __init__(self, subject_list, eeg_dir, face_dir, processor, num_instances=10):
         self.eeg_data = []
         self.labels = []
@@ -84,7 +82,6 @@ class DEAPDataset(Dataset):
                 trial_str = f'{subject_str}_trial{trial_idx+1:02}'
                 frame_files = sorted(glob.glob(os.path.join(face_dir, subject_str, f'{trial_str}_frame_*.png')))
                 if not frame_files:
-                    # logging.warning(f"找不到 {trial_str} 的帧，将为此 trial 的 20 个 segment 添加空 bags。") # 测试时减少日志噪音
                     for _ in range(20): 
                         self.image_bags.append([]) # 添加空列表
                     continue
@@ -99,7 +96,6 @@ class DEAPDataset(Dataset):
                         end_frame_idx = total_frames
                     segment_frame_files = frame_files[start_frame_idx:end_frame_idx]
                     if not segment_frame_files:
-                        # logging.warning(f"Segment {segment_idx} (T{trial_idx+1}) for {subject_str} 无帧。") # 测试时减少日志噪音
                         self.image_bags.append([frame_files[0]] if frame_files else []) # 使用第一帧或空列表
                     else:
                       self.image_bags.append(segment_frame_files) # 添加找到的帧列表
@@ -119,7 +115,6 @@ class DEAPDataset(Dataset):
         subject_id, trial_idx, segment_idx = self.sample_info[idx]
         num_frames_in_bag = len(image_bag_files)
         if num_frames_in_bag == 0:
-            # logging.error(f"索引 {idx} 处的图像 bag 为空！ (来源: s{subject_id:02}, T{trial_idx + 1}, S{segment_idx}) 将使用空白图像。") # 测试时减少日志噪音
             image_bag_np = [np.zeros((224, 224, 3), dtype=np.uint8)] * self.num_instances
         else:
             indices = np.linspace(0, num_frames_in_bag - 1, self.num_instances, dtype=int)
@@ -139,22 +134,20 @@ class DEAPDataset(Dataset):
         images_tensor = torch.tensor(np.stack(image_bag_np), dtype=torch.uint8) 
         return eeg_segment, images_tensor, label
 
+
 # --- 6. 评估函数 (无修改) ---
 def evaluate(model, dataloader, device, mode='multimodal'):
     model.eval() 
     all_preds = []
     all_labels = []
 
-    # --- 关键修改：移除 DataParallel 相关日志 ---
-    logging.info(f"评估将在设备 {device} 上运行。")
-
+    logging.info(f"评估将在设备 {device} (及 DataParallel 子卡) 上运行。")
     logging.info(f"开始在模式 '{mode}' 下评估...")
     eval_loop = tqdm(dataloader, desc=f"Testing ({mode})", leave=False)
     
     with torch.no_grad(): 
         for eeg_data, images_data, labels in eval_loop:
-            
-            # 直接将数据移动到目标 device
+            # DataParallel 会自动将数据分发
             if mode == 'multimodal':
                 eeg_input = eeg_data.to(device)
                 image_input = images_data.to(device)
@@ -179,47 +172,43 @@ def evaluate(model, dataloader, device, mode='multimodal'):
     
     return accuracy, f1, cm
 
-# --- 7. 主函数 (强制单 GPU) ---
+# --- 7. 主函数 (修改为 CPU -> DP -> GPU 逻辑) ---
 def main():
-    setup_logging('test_single_gpu_bs1.log') # 日志名
+    setup_logging(f'test_multi_gpu_bs{BATCH_SIZE}.log') 
     
-    logging.info(f"将强制使用设备: {device}")
+    logging.info(f"将使用设备: {device}")
     if device.type == 'cpu':
-         logging.warning("未检测到 CUDA 设备，将在 CPU 上运行（非常慢）。")
-    elif device.index != 0:
-         logging.warning(f"注意：将使用 GPU {device.index}，而不是默认的 GPU 0。")
+         logging.warning("未检测到 CUDA 设备，将在 CPU 上运行。")
 
-    # Swin 直接在 GPU 上加载
-    logging.info("正在从本地加载 Swin Transformer (到 GPU)...")
+    # --- 关键修改：Swin 严格加载到 CPU ---
+    logging.info("正在从本地加载 Swin Transformer (到 CPU)...")
     try:
         swin_processor = AutoImageProcessor.from_pretrained(MODEL_PATH)
-        swin_model = SwinModel.from_pretrained(MODEL_PATH).to(device) 
-        logging.info("Swin Transformer 加载完毕。")
+        swin_model = SwinModel.from_pretrained(MODEL_PATH) # 不加 .to(device)
+        logging.info("Swin Transformer 加载完毕 (在 CPU)。")
     except Exception as e:
         logging.error(f"加载 Swin Transformer 失败: {e}")
         return
 
-    # 初始化模型架构 (在 GPU 上)
-    logging.info("初始化模型架构 (在 GPU)...")
+    # --- 关键修改：模型初始化严格在 CPU ---
+    logging.info("初始化模型架构 (在 CPU)...")
     try:
-        model_on_gpu = MultiModalClassifier(
+        model_on_cpu = MultiModalClassifier(
             swin_processor=swin_processor,
-            swin_model=swin_model, # 传递已在 GPU 上的 Swin
-            device=device,
+            swin_model=swin_model, # 传递 CPU 上的 Swin
+            # device=device, # 移除 device 参数
             num_classes=NUM_CLASSES,
             num_select=NUM_SELECT,
             num_instances=NUM_INSTANCES
-        ).to(device) # 确保整个模型都在目标 GPU 上
+        ) # 不加 .to(device)
     except Exception as e:
          logging.error(f"初始化 MultiModalClassifier 失败: {e}")
          return
          
-    # 先加载权重到 CPU，再加载 state_dict
-    logging.info(f"正在从 {CHECKPOINT_PATH} 加载权重 (先到 CPU)...")
+    # --- 关键修改：加载权重到 CPU 模型 ---
+    logging.info(f"正在从 {CHECKPOINT_PATH} 加载权重 (到 CPU)...")
     try:
         checkpoint = torch.load(CHECKPOINT_PATH, map_location='cpu') 
-        
-        # 处理 DataParallel 前缀 (在 CPU 上)
         new_state_dict = OrderedDict()
         is_data_parallel = any(key.startswith('module.') for key in checkpoint.keys())
         
@@ -231,33 +220,49 @@ def main():
                 new_state_dict[name] = v
             state_dict_to_load = new_state_dict 
         
-        # 将 state_dict 加载到 GPU 上的模型中
-        model_on_gpu.load_state_dict(state_dict_to_load)
-        logging.info("模型权重加载成功 (通过 state_dict)。")
+        # 将 state_dict 加载到 CPU 上的模型中
+        model_on_cpu.load_state_dict(state_dict_to_load)
+        logging.info("模型权重加载成功 (在 CPU)。")
     except Exception as e:
          logging.error(f"加载模型权重失败: {e}")
          logging.exception("加载 state_dict 时出错:") 
          return
          
-    # --- 移除 OOM 预检测 ---
-    # 我们直接使用 BATCH_SIZE = 1
-
-    logging.info(f"将使用强制 Batch Size = {BATCH_SIZE}")
-    
-    # --- 加载真实数据 ---
-    FINAL_BATCH_SIZE = BATCH_SIZE # 就是 1
+    logging.info(f"将使用总 Batch Size = {BATCH_SIZE}")
+    FINAL_BATCH_SIZE = BATCH_SIZE 
     
     logging.info("初始化完整数据集...")
     eeg_dir = './EEGData'
     face_dir = './faces'
     full_dataset = DEAPDataset(ALL_SUBJECTS, eeg_dir, face_dir, swin_processor, NUM_INSTANCES)
     
-    logging.info(f"将使用全部 {len(full_dataset)} 个样本进行测试 (Batch Size = {FINAL_BATCH_SIZE})...")
-    test_loader = DataLoader(full_dataset, batch_size=FINAL_BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True if device.type=='cuda' else False)
+    RANDOM_SEED = 42 
+    logging.info(f"正在使用种子 {RANDOM_SEED} 重新创建 80/20 训练/验证集划分...")
+    total_size = len(full_dataset)
+    val_size = int(total_size * 0.2) 
+    train_size = total_size - val_size 
+    generator = torch.Generator().manual_seed(RANDOM_SEED)
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=generator)
+    
+    logging.info(f"Train samples (未使用): {len(train_dataset)}, Val samples (用于测试): {len(val_dataset)}")
+    
+    logging.info(f"将使用全部 {len(val_dataset)} 个验证样本进行测试 (Batch Size = {FINAL_BATCH_SIZE})...")
+    test_loader = DataLoader(val_dataset, batch_size=FINAL_BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True if device.type=='cuda' else False)
 
-    # --- 关键修改：移除 DataParallel ---
-    # 直接使用加载好权重的 model_on_gpu
-    model_to_test = model_on_gpu 
+    # --- 关键修改：先包装 DP，再 .to(device) ---
+    model_to_test = model_on_cpu
+    if device.type == 'cuda' and torch.cuda.device_count() > 1:
+        visible_gpus = os.environ.get('CUDA_VISIBLE_DEVICES', 'ALL')
+        logging.info(f"检测到 {torch.cuda.device_count()} 个 GPU (可见: {visible_gpus})，应用 nn.DataParallel...")
+        model_to_test = nn.DataParallel(model_to_test)
+    elif device.type == 'cuda':
+        logging.info("检测到 1 个 GPU。")
+
+    logging.info("正在将模型移动到 GPU...")
+    model_to_test.to(device)
+    logging.info("模型已在 GPU 上。")
+    # --- 修改结束 ---
+    
     model_to_test.eval() # 确保设为评估模式
 
     # --- 执行评估 ---
@@ -273,19 +278,19 @@ def main():
         try:
             plt.figure(figsize=(8, 6))
             sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                        xticklabels=['HAHV', 'HALV', 'LAHV', 'LALV'], 
-                        yticklabels=['HAHV', 'HALV', 'LAHV', 'LALV'])
+                        xticklabels=['HAHV', 'HALV', 'LALV', 'LAHV'], 
+                        yticklabels=['HAHV', 'HALV', 'LALV', 'LAHV'])
             plt.xlabel('Predicted Label')
             plt.ylabel('Actual Label')
-            plt.title(f'Confusion Matrix ({mode}) on All Data (BS={FINAL_BATCH_SIZE})') 
-            plt.savefig(f'confusion_matrix_{mode}_all_data.png') 
-            logging.info(f"混淆矩阵图片已保存为 confusion_matrix_{mode}_all_data.png")
+            plt.title(f'Confusion Matrix ({mode}) on Validation Set (BS={FINAL_BATCH_SIZE})') 
+            plt.savefig(f'confusion_matrix_{mode}_val_set.png') 
+            logging.info(f"混淆矩阵图片已保存为 confusion_matrix_{mode}_val_set.png")
             plt.close() 
         except Exception as e:
             logging.error(f"绘制或保存混淆矩阵失败 ({mode}): {e}")
 
     logging.info("--- 测试完成 ---")
-    print("\n--- 最终结果 (在全部数据上测试) ---")
+    print("\n--- 最终结果 (在 20% 验证集上测试) ---")
     print(f"(使用的 Batch Size: {FINAL_BATCH_SIZE})")
     for mode, metrics in results.items():
         print(f"模式: {mode}")
