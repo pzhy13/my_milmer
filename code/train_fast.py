@@ -38,7 +38,7 @@ MODEL_PATH = "./local_swin_model/"
 # --- 关键修改：BATCH_SIZE 现在是 *每个 GPU* 的 Batch Size ---
 # 假设你 find_max_batch_size 测出 train 模式下每卡可以跑 2
 # 3 块 GPU 的总 Batch Size 将是 2 * 3 = 6
-BATCH_SIZE_PER_GPU = 2 # <--- 警告：这是你需要用新脚本找到的值
+BATCH_SIZE_PER_GPU = 128 # <--- 警告：这是你需要用新脚本找到的值
 # 梯度累积（如果需要，可以设为 1）
 ACCUMULATION_STEPS = 1 # 假设 DDP 提供了足够的总批量
 

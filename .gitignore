@@ -3,9 +3,9 @@
 code/video/
 code/faces/
 code/local_swin_model/
-code/face_video/
+face_video/
 code/EEGData/
-code/data_preprocessed_matlab/
+data_preprocessed_matlab/
 code/_pycache_/
 .vscode/settings.json
 requirements.txt
@@ -25,3 +25,5 @@ code/confusion_matrix_eeg_only_all_data.png
 code/confusion_matrix_image_only_all_data.png
 code/confusion_matrix_multimodal_all_data.png
 code/best_model_fast_run_1.pth
+EEGData/
+faces/
