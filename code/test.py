@@ -13,7 +13,9 @@ import sys
 import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import OrderedDict # 用于处理 DataParallel 权重
-
+import gc
+torch.cuda.empty_cache() # 清理未使用的缓存
+gc.collect()             # 触发Python垃圾回收
 # --- 1. 导入已修正的 model.py (确保它是包含单模态支持的版本) ---
 from model import MultiModalClassifier 
 
@@ -29,11 +31,11 @@ NUM_CLASSES = 4
 NUM_INSTANCES = 10 
 NUM_SELECT = 3     
 MODEL_PATH = "./local_swin_model/" 
-CHECKPOINT_PATH = './best_model_fast_run.pth' # <-- 确认模型路径
+CHECKPOINT_PATH = './best_model_fast_run_1.pth' # <-- 确认模型路径
 
 # --- 关键修改：强制 Batch Size = 1 ---
 # 这是单卡 10GB 显存运行此模型的唯一希望
-BATCH_SIZE = 8
+BATCH_SIZE = 1
 
 # --- 4. 设置日志记录 (Logging) ---
 def setup_logging(log_file='test_single_gpu_bs1.log'): # 新日志名
