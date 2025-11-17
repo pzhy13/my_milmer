@@ -27,7 +27,7 @@ NUM_CLASSES = 4
 NUM_INSTANCES = 10 
 NUM_SELECT = 3     
 MODEL_PATH = "./local_swin_model/" 
-CHECKPOINT_PATH = './best_model_fast_run.pth' 
+CHECKPOINT_PATH = './best_model_fast_run_ddp.pth' 
 
 # --- 关键修改：设置 BATCH_SIZE (占位符) ---
 # 警告：您必须使用 find_max_batch_size.py 找到最大值！
@@ -39,7 +39,7 @@ def setup_logging(log_file='test_multi_gpu.log'): # 新日志名
     logging.getLogger().handlers = [] 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    formatter = logging.Formatter(f'%(asctime)s - RANK_{rank} - %(levelname)s - %(message)s')
+    formatter = logging.Formatter(f'%(asctime)s  - %(levelname)s - %(message)s')
     file_handler = logging.FileHandler(log_file)
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
