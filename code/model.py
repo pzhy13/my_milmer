@@ -29,7 +29,7 @@ class MultiModalClassifier(nn.Module):
         self.img_processor = swin_processor
         self.swin_model = swin_model
         for param in self.swin_model.parameters():
-            param.requires_grad = False 
+            param.requires_grad = True 
 
         self.token_type_embeddings = nn.Embedding(2, input_size)
         

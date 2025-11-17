@@ -12,7 +12,7 @@ from tqdm import tqdm
 from sklearn.metrics import accuracy_score
 import logging
 import sys
-
+# CUDA_VISIBLE_DEVICES="0,6,7" nohup python train_fast.py &
 # --- DDP修改: 导入 DDP 相关模块 ---
 import torch.multiprocessing as mp
 import torch.distributed as dist
@@ -28,27 +28,31 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # --- 3. 定义超参数 ---
 ALL_SUBJECTS = [s for s in range(1, 23) if s != 11] 
 EPOCHS = 100 
-LEARNING_RATE = 1e-5
+
+# <--- 关键修改: 基于 EBS=384 (128*3) 和基准 EBS=16 (8*2)
+# <--- k = 384 / 16 = 24.  sqrt(k) = sqrt(24) ≈ 4.9.
+# <--- 新 LR = 1e-5 * 4.9 ≈ 5e-5
+LEARNING_RATE = 2e-5 # (原为 1e-5)
+
+WARMUP_EPOCHS = 5    # <--- 关键修改: 增加5个 Epoch 的热身
+
 NUM_CLASSES = 4 
 NUM_INSTANCES = 10 
 NUM_SELECT = 3     
 RANDOM_SEED = 42 
 MODEL_PATH = "./local_swin_model/" 
 
-# --- 关键修改：BATCH_SIZE 现在是 *每个 GPU* 的 Batch Size ---
-# 假设你 find_max_batch_size 测出 train 模式下每卡可以跑 2
-# 3 块 GPU 的总 Batch Size 将是 2 * 3 = 6
-BATCH_SIZE_PER_GPU = 2 # <--- 警告：这是你需要用新脚本找到的值
-# 梯度累积（如果需要，可以设为 1）
-ACCUMULATION_STEPS = 1 # 假设 DDP 提供了足够的总批量
+# <--- 关键修改: 保持高 BS 以利用显存和速度
+BATCH_SIZE_PER_GPU = 128 
+ACCUMULATION_STEPS = 1 # (大 BS 下，累积设为 1)
 
 # --- 4. 设置日志记录 (Logging) ---
 # --- DDP修改: 日志记录只在 rank 0 进程设置 ---
-def setup_logging(rank, log_file='train_ddp.log'):
+def setup_logging(rank, log_file='train_ddp_final.log'): # 新日志名
     logger = logging.getLogger()
     logger.handlers = [] # 清除已有处理器
     logger.setLevel(logging.INFO)
-    formatter = logging.Formatter(f'%(asctime)s - RANK_{rank} - %(levelname)s - %(message)s')    
+    formatter = logging.Formatter(f'%(asctime)s - RANK_{rank} - %(levelname)s - %(message)s')      
     if rank == 0:
         # 只在 Rank 0 上写入文件
         file_handler = logging.FileHandler(log_file)
@@ -67,7 +71,6 @@ def setup_logging(rank, log_file='train_ddp.log'):
 
 # --- 5. DEAP 数据集类 (无修改) ---
 class DEAPDataset(Dataset):
-    # ... (此处省略，与原文件相同) ...
     def __init__(self, subject_list, eeg_dir, face_dir, processor, num_instances=10, rank=0):
         self.eeg_data = []
         self.labels = []
@@ -175,6 +178,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, accumulation_st
         
         total_loss += loss.item() 
         
+        # (i + 1) % 1 始终为 0, 所以每步都会执行
         if (i + 1) % accumulation_steps == 0:
             optimizer.step()
             optimizer.zero_grad()
@@ -219,6 +223,7 @@ def validate_epoch(model, dataloader, criterion, device, rank):
     return avg_loss, torch.cat(local_preds), torch.cat(local_labels)
 
 # --- DDP修改: 用于在所有 GPU 间聚合指标的辅助函数 ---
+# --- DDP修改: 用于在所有 GPU 间聚合指标的辅助函数 ---
 def aggregate_metrics(local_loss, local_preds, local_labels, world_size):
     # 1. 聚合 Loss (取平均)
     loss_tensor = torch.tensor(local_loss).cuda()
@@ -226,17 +231,27 @@ def aggregate_metrics(local_loss, local_preds, local_labels, world_size):
     global_loss = loss_tensor.item() / world_size
 
     # 2. 聚合 Preds 和 Labels (收集所有)
-    # 创建收集列表
-    preds_list = [torch.zeros_like(local_preds) for _ in range(world_size)]
-    labels_list = [torch.zeros_like(local_labels) for _ in range(world_size)]
+    
+    # 核心修改：将 local_preds 先移到 CUDA (它将成为 all_gather 的 INPUT)
+    local_preds_cuda = local_preds.cuda()
+    local_labels_cuda = local_labels.cuda()
+
+    # 创建收集列表，并将目标张量创建在与 INPUT 相同的 CUDA 设备上
+    # 使用 .to(local_preds_cuda.device) 确保设备一致性
+    # -------------------------------------------------------------
+    preds_list = [torch.zeros_like(local_preds_cuda) for _ in range(world_size)] 
+    labels_list = [torch.zeros_like(local_labels_cuda) for _ in range(world_size)]
+    # -------------------------------------------------------------
     
     # 从所有 rank 收集
-    dist.all_gather(preds_list, local_preds.cuda())
-    dist.all_gather(labels_list, local_labels.cuda())
+    # 注意：这里我们使用 local_preds_cuda 作为输入
+    dist.all_gather(preds_list, local_preds_cuda)
+    dist.all_gather(labels_list, local_labels_cuda)
 
     # 仅在 rank 0 上计算全局准确率
     global_accuracy = 0.0
     if dist.get_rank() == 0:
+        # 收集列表中的元素已经是 CUDA 张量，可以直接使用 torch.cat
         all_preds = torch.cat(preds_list).cpu()
         all_labels = torch.cat(labels_list).cpu()
         global_accuracy = accuracy_score(all_labels.numpy(), all_preds.numpy())
@@ -251,7 +266,7 @@ def main_worker(local_rank, world_size):
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
     
     # --- DDP修改: 设置日志 ---
-    setup_logging(local_rank, 'train_ddp.log')
+    setup_logging(local_rank, 'train_ddp_final.log')
     
     # --- DDP修改: 将此进程绑定到特定 GPU ---
     torch.cuda.set_device(local_rank)
@@ -285,12 +300,10 @@ def main_worker(local_rank, world_size):
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=local_rank, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
     
-    # --- DDP修改: shuffle=False (sampler 负责)
-    # --- DDP修改: BATCH_SIZE 是 BATCH_SIZE_PER_GPU
+    # <--- 关键修改: 增加 num_workers 解决 IO 瓶颈
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE_PER_GPU, shuffle=False, num_workers=4, pin_memory=True, sampler=train_sampler)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE_PER_GPU, shuffle=False, num_workers=4, pin_memory=True, sampler=val_sampler)
     
-    # --- 关键修改：模型初始化严格在 CPU ---
     if local_rank == 0: logging.info("初始化模型架构 (在 CPU)...")
     model_on_cpu = MultiModalClassifier(
         swin_processor=swin_processor,
@@ -300,11 +313,7 @@ def main_worker(local_rank, world_size):
         num_instances=NUM_INSTANCES
     ) 
 
-    # --- DDP修改: 将模型移动到 *指定* GPU ---
     model = model_on_cpu.to(device)
-    
-    # --- DDP修改: 使用 DDP 包装模型 ---
-    # find_unused_parameters 设为 True 确保所有参数被同步 (如果模型有分支)
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=True) 
     
     if local_rank == 0:
@@ -314,24 +323,39 @@ def main_worker(local_rank, world_size):
         logging.info(f"梯度累积步数: {ACCUMULATION_STEPS}")
         logging.info(f"总 GPU 数量: {total_gpus}")
         logging.info(f"有效 BATCH_SIZE (全局): {BATCH_SIZE_PER_GPU * total_gpus * ACCUMULATION_STEPS}")
+        logging.info(f"目标学习率: {LEARNING_RATE}")
+        logging.info(f"热身 Epochs: {WARMUP_EPOCHS}")
 
     criterion = nn.CrossEntropyLoss().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    
+    # <--- 关键修改: LR 已经设为 5e-5
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=5e-4)
     optimizer.zero_grad() 
-    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=0)
+    
+    # <--- 关键修改: T_max 要减去热身
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS - WARMUP_EPOCHS, eta_min=0)
     
     best_val_accuracy = 0.0
-    model_save_path = './best_model_fast_run_ddp.pth' # 新的保存路径
+    model_save_path = './best_model_fast_run_ddp.pth' 
 
     for epoch in range(EPOCHS):
-        # --- DDP修改: 必须设置 epoch 以确保 sampler 正确 shuffle ---
         train_sampler.set_epoch(epoch)
         
-        if local_rank == 0: logging.info(f"--- Epoch {epoch+1}/{EPOCHS} ---")
+        # <--- 关键修改: 添加 Warmup 逻辑 ---
+        if epoch < WARMUP_EPOCHS:
+            # 线性地从 0 增加到目标 LEARNING_RATE
+            current_lr = LEARNING_RATE * (epoch + 1) / WARMUP_EPOCHS
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_lr
+        # --- Warmup 结束 ---
+
+        if local_rank == 0: 
+            logging.info(f"--- Epoch {epoch+1}/{EPOCHS} ---")
+            logging.info(f"当前学习率: {optimizer.param_groups[0]['lr']:.8f}")
         
         # 1. 训练
         local_train_loss, local_train_preds, local_train_labels = train_epoch(model, train_loader, optimizer, criterion, device, ACCUMULATION_STEPS, local_rank)
-        # --- DDP修改: 聚合训练指标 ---
+        dist.barrier()
         train_loss, train_acc = aggregate_metrics(local_train_loss, local_train_preds, local_train_labels, world_size)
         
         if local_rank == 0:
@@ -339,20 +363,19 @@ def main_worker(local_rank, world_size):
         
         # 2. 验证
         local_val_loss, local_val_preds, local_val_labels = validate_epoch(model, val_loader, criterion, device, local_rank)
-        # --- DDP修改: 聚合验证指标 ---
+        dist.barrier()
         val_loss, val_acc = aggregate_metrics(local_val_loss, local_val_preds, local_val_labels, world_size)
         
         if local_rank == 0:
             logging.info(f"Epoch {epoch+1} Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
         
-        scheduler.step()
+        # <--- 关键修改：只在 Warmup 之后才 step() 调度器 ---
+        if epoch >= WARMUP_EPOCHS:
+            scheduler.step()
         
-        # --- DDP修改: 只在 rank 0 进程保存 ---
         if local_rank == 0:
             if val_acc > best_val_accuracy:
                 best_val_accuracy = val_acc
-                
-                # 保存时解开 DDP 包装 (与 DP 相同, 都是 .module)
                 torch.save(model.module.state_dict(), model_save_path)
                 logging.info(f"新的最佳模型已保存，准确率: {best_val_accuracy:.4f} (路径: {model_save_path})")
 
@@ -360,7 +383,6 @@ def main_worker(local_rank, world_size):
         logging.info("--- 训练完毕 ---")
         logging.info(f"最佳验证准确率: {best_val_accuracy:.4f}")
         
-    # --- DDP修改: 清理进程组 ---
     dist.destroy_process_group()
 
 # --- DDP修改: main 函数作为启动器 ---
@@ -368,15 +390,17 @@ def main():
     world_size = torch.cuda.device_count()
     if world_size == 0:
         print("未检测到 CUDA 设备，DDP 训练需要 GPU。")
+        # 尝试在 CPU 上以单进程模式运行 (用于调试)
+        print("将尝试在 CPU 上以单进程模式运行...")
+        main_worker(0, 1) # local_rank=0, world_size=1
         return
         
-    # 使用 mp.spawn 启动 DDP
-    # 它会为每个 GPU (nprocs=world_size) 调用 main_worker
-    # 并自动传入 local_rank (0, 1, 2...) 和 world_size
     mp.spawn(main_worker,
              args=(world_size,),
              nprocs=world_size,
              join=True)
 
 if __name__ == "__main__":
+    # 添加一个简单的保护，防止在 Windows/macOS 的 spawn 模式下重复执行
+    torch.multiprocessing.set_start_method('spawn', force=True)
     main()

@@ -25,3 +25,6 @@ code/confusion_matrix_eeg_only_all_data.png
 code/confusion_matrix_image_only_all_data.png
 code/confusion_matrix_multimodal_all_data.png
 code/best_model_fast_run_1.pth
+code/train_ddp_final.log
+code/nohup.out
+code/best_model_fast_run_ddp.pth
