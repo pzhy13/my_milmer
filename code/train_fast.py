@@ -42,6 +42,20 @@ NUM_SELECT = 3
 RANDOM_SEED = 42 
 MODEL_PATH = "./local_swin_model/" 
 
+# --- 新增 EEG 参数配置 ---
+# 请根据您的实际 EEG 数据（.npy 文件）调整这些值
+# 假设您的 eeg_size=384 对应 32通道 * 12时间点 (仅作示例)
+# 如果您的数据是其他形状，请务必修改此处！
+
+# --- 关键修改：根据 EEG_preprocessing.py 设置参数 ---
+# 数据形状为 (Batch, 32, 384) -> (Batch, Channels, Time)
+EEG_CHANNELS = 32 
+EEG_TIME_PTS = 384  # 3 seconds * 128 Hz
+# EEG_SIZE_TOTAL 仅用于旧的 Linear 层逻辑或参数传递，
+# NervFormer 会直接使用 CHANNELS 和 TIME_PTS 构建卷积
+EEG_SIZE_TOTAL = EEG_CHANNELS * EEG_TIME_PTS 
+
+
 # <--- 关键修改: 保持高 BS 以利用显存和速度
 BATCH_SIZE_PER_GPU = 128 
 ACCUMULATION_STEPS = 1 # (大 BS 下，累积设为 1)
@@ -301,16 +315,21 @@ def main_worker(local_rank, world_size):
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
     
     # <--- 关键修改: 增加 num_workers 解决 IO 瓶颈
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE_PER_GPU, shuffle=False, num_workers=4, pin_memory=True, sampler=train_sampler)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE_PER_GPU, shuffle=False, num_workers=4, pin_memory=True, sampler=val_sampler)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE_PER_GPU, shuffle=False, num_workers=2, pin_memory=True, sampler=train_sampler)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE_PER_GPU, shuffle=False, num_workers=2, pin_memory=True, sampler=val_sampler)
     
     if local_rank == 0: logging.info("初始化模型架构 (在 CPU)...")
+    
+    # --- 传入 NervFormer 相关参数 ---
     model_on_cpu = MultiModalClassifier(
         swin_processor=swin_processor,
         swin_model=swin_model,
         num_classes=NUM_CLASSES,
         num_select=NUM_SELECT,
-        num_instances=NUM_INSTANCES
+        num_instances=NUM_INSTANCES,
+        use_nerv_eeg=True,        # 开启 NervFormer
+        eeg_channels=EEG_CHANNELS,# 通道数
+        eeg_time_len=EEG_TIME_PTS # 时间点数
     ) 
 
     model = model_on_cpu.to(device)
@@ -325,6 +344,7 @@ def main_worker(local_rank, world_size):
         logging.info(f"有效 BATCH_SIZE (全局): {BATCH_SIZE_PER_GPU * total_gpus * ACCUMULATION_STEPS}")
         logging.info(f"目标学习率: {LEARNING_RATE}")
         logging.info(f"热身 Epochs: {WARMUP_EPOCHS}")
+        logging.info(f"EEG Config: Channels={EEG_CHANNELS}, TimePts={EEG_TIME_PTS}")
 
     criterion = nn.CrossEntropyLoss().to(device)
     
