@@ -29,3 +29,4 @@ code/train_ddp_final.log
 code/nohup.out
 code/best_model_fast_run_ddp.pth
 code/test_multi_gpu_bs12.log
+code/best_model_fast_run_ddp_1120.pth

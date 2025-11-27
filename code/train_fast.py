@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, random_split, Subset
 import torch.optim.lr_scheduler as lr_scheduler
 from transformers import SwinModel, AutoImageProcessor
 from PIL import Image
@@ -12,7 +12,9 @@ from tqdm import tqdm
 from sklearn.metrics import accuracy_score
 import logging
 import sys
-# CUDA_VISIBLE_DEVICES="0,6,7" nohup python train_fast.py &
+# --- 新增: 导入 torchvision 用于数据增强 ---
+from torchvision import transforms 
+
 # --- DDP修改: 导入 DDP 相关模块 ---
 import torch.multiprocessing as mp
 import torch.distributed as dist
@@ -28,59 +30,38 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # --- 3. 定义超参数 ---
 ALL_SUBJECTS = [s for s in range(1, 23) if s != 11] 
 EPOCHS = 100 
-
-# <--- 关键修改: 基于 EBS=384 (128*3) 和基准 EBS=16 (8*2)
-# <--- k = 384 / 16 = 24.  sqrt(k) = sqrt(24) ≈ 4.9.
-# <--- 新 LR = 1e-5 * 4.9 ≈ 5e-5
-LEARNING_RATE = 2e-5 # (原为 1e-5)
-
-WARMUP_EPOCHS = 5    # <--- 关键修改: 增加5个 Epoch 的热身
-
+LEARNING_RATE = 2e-5 
+WARMUP_EPOCHS = 5    
 NUM_CLASSES = 4 
 NUM_INSTANCES = 10 
 NUM_SELECT = 3     
 RANDOM_SEED = 42 
-MODEL_PATH = "./local_swin_model/" 
+MODEL_PATH = "./local_swin_model/" # 请确保此路径正确
 
 # --- 新增 EEG 参数配置 ---
-# 请根据您的实际 EEG 数据（.npy 文件）调整这些值
-# 假设您的 eeg_size=384 对应 32通道 * 12时间点 (仅作示例)
-# 如果您的数据是其他形状，请务必修改此处！
-
-# --- 关键修改：根据 EEG_preprocessing.py 设置参数 ---
-# 数据形状为 (Batch, 32, 384) -> (Batch, Channels, Time)
 EEG_CHANNELS = 32 
-EEG_TIME_PTS = 384  # 3 seconds * 128 Hz
-# EEG_SIZE_TOTAL 仅用于旧的 Linear 层逻辑或参数传递，
-# NervFormer 会直接使用 CHANNELS 和 TIME_PTS 构建卷积
+EEG_TIME_PTS = 384  
 EEG_SIZE_TOTAL = EEG_CHANNELS * EEG_TIME_PTS 
 
-
-# <--- 关键修改: 保持高 BS 以利用显存和速度
 BATCH_SIZE_PER_GPU = 128 
-ACCUMULATION_STEPS = 1 # (大 BS 下，累积设为 1)
+ACCUMULATION_STEPS = 1 
 
 # --- 4. 设置日志记录 (Logging) ---
-# --- DDP修改: 日志记录只在 rank 0 进程设置 ---
-def setup_logging(rank, log_file='train_ddp_final.log'): # 新日志名
+def setup_logging(rank, log_file='train_ddp_final.log'): 
     logger = logging.getLogger()
-    logger.handlers = [] # 清除已有处理器
+    logger.handlers = [] 
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter(f'%(asctime)s - RANK_{rank} - %(levelname)s - %(message)s')      
     if rank == 0:
-        # 只在 Rank 0 上写入文件
         file_handler = logging.FileHandler(log_file)
         file_handler.setLevel(logging.INFO)
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
-        
-        # Rank 0 也在控制台输出
         stream_handler = logging.StreamHandler(sys.stdout)
         stream_handler.setLevel(logging.INFO)
         stream_handler.setFormatter(formatter)
         logger.addHandler(stream_handler)
     else:
-        # 其他 Rank 只设置一个空处理器，避免 "no handler" 警告
         logger.addHandler(logging.NullHandler())
 
 # --- 5. DEAP 数据集类 (无修改) ---
@@ -92,7 +73,6 @@ class DEAPDataset(Dataset):
         self.processor = processor
         self.num_instances = num_instances
         
-        # 只在 rank 0 显示 tqdm 进度条
         if rank == 0:
             logging.info(f"开始为 {len(subject_list)} 个被试加载数据...")
             subject_loop = tqdm(subject_list)
@@ -110,7 +90,7 @@ class DEAPDataset(Dataset):
             subject_labels = np.load(label_file)
             self.eeg_data.append(subject_eeg_data)
             self.labels.append(subject_labels)
-            for trial_idx in range(40): # 40 trials
+            for trial_idx in range(40): 
                 trial_str = f'{subject_str}_trial{trial_idx+1:02}'
                 frame_files = sorted(glob.glob(os.path.join(face_dir, subject_str, f'{trial_str}_frame_*.png')))
                 if not frame_files:
@@ -121,7 +101,7 @@ class DEAPDataset(Dataset):
                 frames_per_segment_actual = total_frames // 20 
                 if frames_per_segment_actual == 0: 
                     frames_per_segment_actual = total_frames
-                for segment_idx in range(20): # 20 segments
+                for segment_idx in range(20): 
                     start_frame_idx = segment_idx * frames_per_segment_actual
                     end_frame_idx = (segment_idx + 1) * frames_per_segment_actual
                     if segment_idx == 19: 
@@ -134,13 +114,16 @@ class DEAPDataset(Dataset):
         self.labels = np.concatenate(self.labels, axis=0)
         if rank == 0: logging.info(f"总共加载 {len(self.labels)} 个样本。")
         assert len(self.eeg_data) == len(self.labels) == len(self.image_bags)
+        
     def __len__(self):
         return len(self.labels)
+    
     def __getitem__(self, idx):
         eeg_segment = torch.tensor(self.eeg_data[idx], dtype=torch.float32)
         label = torch.tensor(self.labels[idx], dtype=torch.long)
         image_bag_files = self.image_bags[idx]
         num_frames_in_bag = len(image_bag_files)
+        
         if num_frames_in_bag == 0:
             image_bag_np = [np.zeros((224, 224, 3), dtype=np.uint8)] * self.num_instances
         else:
@@ -150,34 +133,72 @@ class DEAPDataset(Dataset):
                 img_path = image_bag_files[img_idx]
                 try:
                     img = Image.open(img_path).convert("RGB")
-                    img_resized = img.resize((224, 224))
+                    img_resized = img.resize((224, 224)) 
                     img_np = np.array(img_resized)
                     if img_np.shape != (224, 224, 3):
                         img_np = np.zeros((224, 224, 3), dtype=np.uint8)
                     image_bag_np.append(img_np)
                 except Exception as e:
                     image_bag_np.append(np.zeros((224, 224, 3), dtype=np.uint8))
+        
         images_tensor = torch.tensor(np.stack(image_bag_np), dtype=torch.uint8) 
         return eeg_segment, images_tensor, label
 
 
-# --- 6. 训练和验证函数 ---
-# --- DDP修改: 移除 DataParallel 的 loss.mean() 逻辑 ---
-# --- DDP修改: 返回局部的 preds 和 labels, 在 main_worker 中聚合 ---
+# === 关键修改: 将 TransformWrapper 移到顶层 ===
+# 修复: AttributeError: Can't pickle local object
+class TransformWrapper(Dataset):
+    """
+    一个包装器，用于在数据集被 random_split 后，对训练子集应用图像增强。
+    """
+    def __init__(self, subset: Subset, transform=None):
+        self.subset = subset
+        self.transform = transform
+        # 确保原始数据集的 num_instances 被保留
+        self.num_instances = subset.dataset.num_instances 
+
+    def __len__(self):
+        return len(self.subset)
+
+    def __getitem__(self, idx):
+        # subset[idx] 返回的是 (eeg_segment, images_tensor, label)
+        eeg, imgs, label = self.subset[idx]
+        
+        # imgs: (NUM_INSTANCES, 224, 224, 3) uint8 tensor
+        if self.transform:
+            new_imgs = []
+            # 遍历 bag 中的每个实例
+            for i in range(imgs.shape[0]):
+                # 将 (H, W, C) uint8 Tensor 转换为 PIL Image (需要 C, H, W)
+                pil_img = transforms.ToPILImage()(imgs[i].permute(2, 0, 1))
+                
+                # 应用增强
+                aug_img = self.transform(pil_img)
+                
+                # 将增强后的 PIL Image 转换回 (H, W, C) numpy 数组
+                # 注意: np.array(PIL Image) 默认返回 (H, W, C)
+                new_imgs.append(np.array(aug_img))
+            
+            # 堆叠回 Tensor
+            imgs = torch.tensor(np.stack(new_imgs), dtype=torch.uint8)
+            
+        return eeg, imgs, label
+# ===============================================
+
+
+# --- 6. 训练和验证函数 (无修改) ---
 def train_epoch(model, dataloader, optimizer, criterion, device, accumulation_steps, rank):
     model.train()
     total_loss = 0
     local_preds = []
     local_labels = []
     
-    # --- DDP修改: Dataloader 包装在 tqdm 中 (只在 rank 0 显示) ---
     if rank == 0:
         train_loop = tqdm(dataloader, desc="Training", leave=False)
     else:
         train_loop = dataloader
 
     for i, (eeg_data, images_data, labels) in enumerate(train_loop):
-        # 数据移动到 *当前进程* 分配的 GPU
         eeg_data = eeg_data.to(device) 
         images_data = images_data.to(device) 
         labels = labels.to(device)
@@ -185,14 +206,11 @@ def train_epoch(model, dataloader, optimizer, criterion, device, accumulation_st
         outputs = model(eeg_data, images_data)
         loss = criterion(outputs, labels)
         
-        # DDP 不需要 .mean()，loss 已经是标量
-            
         loss = loss / accumulation_steps
-        loss.backward() # DDP 会在此处自动同步梯度
+        loss.backward() 
         
         total_loss += loss.item() 
         
-        # (i + 1) % 1 始终为 0, 所以每步都会执行
         if (i + 1) % accumulation_steps == 0:
             optimizer.step()
             optimizer.zero_grad()
@@ -202,8 +220,6 @@ def train_epoch(model, dataloader, optimizer, criterion, device, accumulation_st
         local_labels.append(labels.cpu())
         
     avg_loss = (total_loss / len(dataloader)) * accumulation_steps
-    
-    # 返回 *局部的* loss, preds, labels
     return avg_loss, torch.cat(local_preds), torch.cat(local_labels)
 
 def validate_epoch(model, dataloader, criterion, device, rank):
@@ -226,8 +242,6 @@ def validate_epoch(model, dataloader, criterion, device, rank):
             outputs = model(eeg_data, images_data)
             loss = criterion(outputs, labels)
             
-            # DDP 不需要 .mean()
-            
             total_loss += loss.item()
             preds = torch.argmax(outputs, dim=1)
             local_preds.append(preds.cpu())
@@ -236,36 +250,22 @@ def validate_epoch(model, dataloader, criterion, device, rank):
     avg_loss = total_loss / len(dataloader)
     return avg_loss, torch.cat(local_preds), torch.cat(local_labels)
 
-# --- DDP修改: 用于在所有 GPU 间聚合指标的辅助函数 ---
-# --- DDP修改: 用于在所有 GPU 间聚合指标的辅助函数 ---
 def aggregate_metrics(local_loss, local_preds, local_labels, world_size):
-    # 1. 聚合 Loss (取平均)
     loss_tensor = torch.tensor(local_loss).cuda()
     dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
     global_loss = loss_tensor.item() / world_size
 
-    # 2. 聚合 Preds 和 Labels (收集所有)
-    
-    # 核心修改：将 local_preds 先移到 CUDA (它将成为 all_gather 的 INPUT)
     local_preds_cuda = local_preds.cuda()
     local_labels_cuda = local_labels.cuda()
 
-    # 创建收集列表，并将目标张量创建在与 INPUT 相同的 CUDA 设备上
-    # 使用 .to(local_preds_cuda.device) 确保设备一致性
-    # -------------------------------------------------------------
     preds_list = [torch.zeros_like(local_preds_cuda) for _ in range(world_size)] 
     labels_list = [torch.zeros_like(local_labels_cuda) for _ in range(world_size)]
-    # -------------------------------------------------------------
     
-    # 从所有 rank 收集
-    # 注意：这里我们使用 local_preds_cuda 作为输入
     dist.all_gather(preds_list, local_preds_cuda)
     dist.all_gather(labels_list, local_labels_cuda)
 
-    # 仅在 rank 0 上计算全局准确率
     global_accuracy = 0.0
     if dist.get_rank() == 0:
-        # 收集列表中的元素已经是 CUDA 张量，可以直接使用 torch.cat
         all_preds = torch.cat(preds_list).cpu()
         all_labels = torch.cat(labels_list).cpu()
         global_accuracy = accuracy_score(all_labels.numpy(), all_preds.numpy())
@@ -274,39 +274,49 @@ def aggregate_metrics(local_loss, local_preds, local_labels, world_size):
 
 # --- 7. 主函数 (重构为 DDP 的 main_worker) ---
 def main_worker(local_rank, world_size):
-    # --- DDP修改: 设置进程组 ---
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355' # 确保端口未被占用
+    os.environ['MASTER_PORT'] = '12355' 
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
     
-    # --- DDP修改: 设置日志 ---
     setup_logging(local_rank, 'train_ddp_final.log')
     
-    # --- DDP修改: 将此进程绑定到特定 GPU ---
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     
     if local_rank == 0:
         logging.info(f"--- DDP 训练启动, World Size (GPU数量): {world_size} ---")
 
-    # --- 关键修改：Swin 严格加载到 CPU ---
-    if local_rank == 0: logging.info("正在从本地加载 Swin Transformer (到 CPU)...")
     swin_processor = AutoImageProcessor.from_pretrained(MODEL_PATH)
-    swin_model = SwinModel.from_pretrained(MODEL_PATH) # 不加 .to(device)
-    if local_rank == 0: logging.info("Swin Transformer 加载完毕 (在 CPU)。")
+    swin_model = SwinModel.from_pretrained(MODEL_PATH) 
+    
+    # --- 定义数据增强 ---
+    train_transforms = transforms.Compose([
+        # 强制将 PIL Image 转换为 Tensor 再处理会更复杂，这里只用 PIL Image 友好的 Transforms
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(degrees=10),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+    ])
     
     if local_rank == 0: logging.info("初始化完整数据集...")
-    eeg_dir = './EEGData'
-    face_dir = './faces'
-    # --- DDP修改: 传入 rank 以控制日志/tqdm ---
+    eeg_dir = './EEGData' # 请确保此路径正确
+    face_dir = './faces'  # 请确保此路径正确
+    
+    # 初始化完整的 DEAPDataset
     full_dataset = DEAPDataset(ALL_SUBJECTS, eeg_dir, face_dir, swin_processor, NUM_INSTANCES, rank=local_rank)
     
-    if local_rank == 0: logging.info("正在创建 80/20 训练/验证集...")
     total_size = len(full_dataset)
     val_size = int(total_size * 0.2) 
     train_size = total_size - val_size 
     generator = torch.Generator().manual_seed(RANDOM_SEED)
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=generator)
+    
+    # random_split 返回的是 Subset
+    train_subset, val_subset = random_split(full_dataset, [train_size, val_size], generator=generator)
+    
+    # --- 使用顶层定义的 TransformWrapper 来包裹训练集子集，应用增强 ---
+    train_dataset = TransformWrapper(train_subset, transform=train_transforms)
+    
+    # --- 验证集子集保持不变 (不应用增强) ---
+    val_dataset = TransformWrapper(val_subset, transform=None)
     
     if local_rank == 0: logging.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
     
@@ -327,9 +337,15 @@ def main_worker(local_rank, world_size):
         num_classes=NUM_CLASSES,
         num_select=NUM_SELECT,
         num_instances=NUM_INSTANCES,
-        use_nerv_eeg=True,        # 开启 NervFormer
-        eeg_channels=EEG_CHANNELS,# 通道数
-        eeg_time_len=EEG_TIME_PTS # 时间点数
+        use_nerv_eeg=True,        
+        eeg_channels=EEG_CHANNELS,
+        eeg_time_len=EEG_TIME_PTS,
+        # ==================================================
+        # [重要修改] 提高 Dropout 率，配合 Swin 冻结策略
+        # 从 0.3 提高到 0.5，抑制 NervFormer 过拟合
+        # ==================================================
+        transformer_dropout_rate=0.5,
+        cls_dropout_rate=0.5
     ) 
 
     model = model_on_cpu.to(device)
@@ -339,20 +355,17 @@ def main_worker(local_rank, world_size):
         total_gpus = world_size
         logging.info(f"--- 开始单次训练 (Subject-Dependent) ---")
         logging.info(f"物理 BATCH_SIZE (每 GPU): {BATCH_SIZE_PER_GPU}")
-        logging.info(f"梯度累积步数: {ACCUMULATION_STEPS}")
-        logging.info(f"总 GPU 数量: {total_gpus}")
         logging.info(f"有效 BATCH_SIZE (全局): {BATCH_SIZE_PER_GPU * total_gpus * ACCUMULATION_STEPS}")
         logging.info(f"目标学习率: {LEARNING_RATE}")
         logging.info(f"热身 Epochs: {WARMUP_EPOCHS}")
-        logging.info(f"EEG Config: Channels={EEG_CHANNELS}, TimePts={EEG_TIME_PTS}")
+        logging.info(f"正则化: Label Smoothing=0.1, Dropout=0.5 (Increased)")
 
-    criterion = nn.CrossEntropyLoss().to(device)
+    # --- 关键修改: 使用 Label Smoothing 防止过拟合 ---
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1).to(device)
     
-    # <--- 关键修改: LR 已经设为 5e-5
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=5e-4)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
     optimizer.zero_grad() 
     
-    # <--- 关键修改: T_max 要减去热身
     scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS - WARMUP_EPOCHS, eta_min=0)
     
     best_val_accuracy = 0.0
@@ -361,13 +374,10 @@ def main_worker(local_rank, world_size):
     for epoch in range(EPOCHS):
         train_sampler.set_epoch(epoch)
         
-        # <--- 关键修改: 添加 Warmup 逻辑 ---
         if epoch < WARMUP_EPOCHS:
-            # 线性地从 0 增加到目标 LEARNING_RATE
             current_lr = LEARNING_RATE * (epoch + 1) / WARMUP_EPOCHS
             for param_group in optimizer.param_groups:
                 param_group['lr'] = current_lr
-        # --- Warmup 结束 ---
 
         if local_rank == 0: 
             logging.info(f"--- Epoch {epoch+1}/{EPOCHS} ---")
@@ -389,7 +399,6 @@ def main_worker(local_rank, world_size):
         if local_rank == 0:
             logging.info(f"Epoch {epoch+1} Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
         
-        # <--- 关键修改：只在 Warmup 之后才 step() 调度器 ---
         if epoch >= WARMUP_EPOCHS:
             scheduler.step()
         
@@ -409,10 +418,7 @@ def main_worker(local_rank, world_size):
 def main():
     world_size = torch.cuda.device_count()
     if world_size == 0:
-        print("未检测到 CUDA 设备，DDP 训练需要 GPU。")
-        # 尝试在 CPU 上以单进程模式运行 (用于调试)
-        print("将尝试在 CPU 上以单进程模式运行...")
-        main_worker(0, 1) # local_rank=0, world_size=1
+        print("未检测到 CUDA 设备。")
         return
         
     mp.spawn(main_worker,
@@ -421,6 +427,5 @@ def main():
              join=True)
 
 if __name__ == "__main__":
-    # 添加一个简单的保护，防止在 Windows/macOS 的 spawn 模式下重复执行
     torch.multiprocessing.set_start_method('spawn', force=True)
     main()
